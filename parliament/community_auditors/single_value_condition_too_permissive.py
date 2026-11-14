@@ -43,22 +43,35 @@ def audit(policy: Policy) -> None:
         "aws:VpcSourceIp",
     ]
 
+    # Turn the key patterns into anchored, case-insensitive regexes so that
+    # patterns like `aws:ResourceTag/*` match the full condition key and
+    # similarly named keys (ex. `aws:ResourceTaggy`) are not included.
+    single_valued_key_patterns = [
+        re.compile(
+            "^{}$".format(re.escape(key).replace(r"\*", ".*")),
+            re.IGNORECASE,
+        )
+        for key in global_single_valued_condition_keys
+    ]
+
     for stmt in policy.statements:
         if "Condition" not in stmt.stmt:
-            return
+            continue
 
         conditions = stmt.stmt["Condition"]
         for condition in conditions:
             # The operator is the first element (ex. `StringLike`) and the condition_block follows it
             operator = condition[0]
             condition_block = condition[1]
-            if re.match(r"^For(All|Any)Values:", operator):
-                keys = list(k for k, _v in condition_block)
-                if any(
-                    any(re.match(k, key) for k in global_single_valued_condition_keys)
-                    for key in keys
-                ):
-                    policy.add_finding(
-                        "SINGLE_VALUE_CONDITION_TOO_PERMISSIVE",
-                        detail="Checking a single value conditional key against a set of values results in overly permissive policies.",
-                    )
+            if not re.match(r"^For(All|Any)Values:", operator):
+                continue
+            keys = list(k for k, _v in condition_block)
+            if any(
+                any(pattern.match(key) for pattern in single_valued_key_patterns)
+                for key in keys
+            ):
+                policy.add_finding(
+                    "SINGLE_VALUE_CONDITION_TOO_PERMISSIVE",
+                    detail="Checking a single value conditional key against a set of values results in overly permissive policies.",
+                )
+                break
