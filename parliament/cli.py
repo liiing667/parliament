@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import copy
 import json
 import jsoncfg
 import logging
@@ -14,7 +15,7 @@ from parliament import (
     analyze_policy_string,
     enhance_finding,
     override_config,
-    config,
+    config as default_config,
     __version__,
 )
 from parliament.misc import make_list
@@ -233,6 +234,9 @@ def main(argv):
     # Change the exit status if there are errors
     findings = []
 
+    # Build a scan-local config so concurrent scans and later override
+    # calls cannot leak settings into this run.
+    scan_config = copy.deepcopy(default_config)
     if args.include_community_auditors:
         community_auditors_directory = "community_auditors"
         community_auditors_override_file = (
@@ -240,8 +244,8 @@ def main(argv):
             / community_auditors_directory
             / "config_override.yaml"
         )
-        override_config(community_auditors_override_file)
-    override_config(args.config)
+        override_config(community_auditors_override_file, scan_config)
+    override_config(args.config, scan_config)
 
     if args.aws_managed_policies:
         file_paths = find_files(directory=args.aws_managed_policies)
@@ -255,7 +259,7 @@ def main(argv):
                     file_path,
                     private_auditors_custom_path=args.private_auditors,
                     include_community_auditors=args.include_community_auditors,
-                    config=config,
+                    config=scan_config,
                 )
                 findings.extend(policy.findings)
 
@@ -284,6 +288,9 @@ def main(argv):
                     policy = analyze_policy_string(
                         json.dumps(version.Document()),
                         policy.Arn(),
+                        private_auditors_custom_path=args.private_auditors,
+                        include_community_auditors=args.include_community_auditors,
+                        config=scan_config,
                     )
                     findings.extend(policy.findings)
 
@@ -295,7 +302,7 @@ def main(argv):
                         user.Arn(),
                         private_auditors_custom_path=args.private_auditors,
                         include_community_auditors=args.include_community_auditors,
-                        config=config,
+                        config=scan_config,
                     )
                     findings.extend(policy.findings)
             for role in auth_details_json.RoleDetailList:
@@ -305,7 +312,7 @@ def main(argv):
                         role.Arn(),
                         private_auditors_custom_path=args.private_auditors,
                         include_community_auditors=args.include_community_auditors,
-                        config=config,
+                        config=scan_config,
                     )
                     findings.extend(policy.findings)
             for group in auth_details_json.GroupDetailList:
@@ -315,7 +322,7 @@ def main(argv):
                         group.Arn(),
                         private_auditors_custom_path=args.private_auditors,
                         include_community_auditors=args.include_community_auditors,
-                        config=config,
+                        config=scan_config,
                     )
                     findings.extend(policy.findings)
     elif args.string:
@@ -323,7 +330,7 @@ def main(argv):
             args.string,
             private_auditors_custom_path=args.private_auditors,
             include_community_auditors=args.include_community_auditors,
-            config=config,
+            config=scan_config,
         )
         findings.extend(policy.findings)
     elif args.files and not args.directory:
@@ -337,7 +344,7 @@ def main(argv):
                 file_path,
                 private_auditors_custom_path=args.private_auditors,
                 include_community_auditors=args.include_community_auditors,
-                config=config,
+                config=scan_config,
             )
             findings.extend(policy.findings)
     elif args.file and not args.directory:
@@ -348,7 +355,7 @@ def main(argv):
             args.file.name,
             private_auditors_custom_path=args.private_auditors,
             include_community_auditors=args.include_community_auditors,
-            config=config,
+            config=scan_config,
         )
         findings.extend(policy.findings)
     elif args.directory:
@@ -365,7 +372,7 @@ def main(argv):
                     file_path,
                     private_auditors_custom_path=args.private_auditors,
                     include_community_auditors=args.include_community_auditors,
-                    config=config,
+                    config=scan_config,
                 )
                 findings.extend(policy.findings)
     else:
@@ -374,7 +381,7 @@ def main(argv):
 
     filtered_findings = []
     for finding in findings:
-        finding = enhance_finding(finding)
+        finding = enhance_finding(finding, scan_config)
         if not is_finding_filtered(finding, args.minimum_severity):
             filtered_findings.append(finding)
 

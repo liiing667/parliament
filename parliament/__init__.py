@@ -4,11 +4,13 @@ This library is a linter for AWS IAM policies.
 
 __version__ = "1.6.4"
 
+import copy
 import fnmatch
 import functools
 import json
 import jsoncfg
 import re
+from pathlib import Path
 
 import pkg_resources
 import yaml
@@ -22,24 +24,41 @@ config_path = pkg_resources.resource_filename(__name__, "config.yaml")
 config = yaml.safe_load(open(config_path, "r"))
 
 
-def override_config(override_config_path):
-    if override_config_path is None:
-        return
-
-    # Load the override file
-    override_config = yaml.safe_load(open(override_config_path, "r"))
-
-    # Over-write the settings
-    for finding_type, settings in override_config.items():
+def _merge_config(config, overrides):
+    """Deep-merge finding overrides into a config dict, keyed by finding issue."""
+    for finding_type, settings in overrides.items():
         if finding_type not in config:
             config[finding_type] = {}
         for setting, setting_value in settings.items():
             config[finding_type][setting] = setting_value
+    return config
 
 
-def enhance_finding(finding):
+def override_config(override_config_path, config=None):
+    """
+    Apply the overrides in the given file on top of a config dict.
+
+    When no config is given, the module-level default config is updated
+    (the historical behavior). Returns the config that was modified.
+    """
+    if override_config_path is None:
+        return config
+
+    if config is None:
+        config = globals()["config"]
+
+    # Load the override file
+    overrides = yaml.safe_load(open(override_config_path, "r")) or {}
+
+    # Over-write the settings
+    return _merge_config(config, overrides)
+
+
+def enhance_finding(finding, config=None):
+    if config is None:
+        config = globals()["config"]
     if finding.issue not in config:
-        raise Exception("Uknown finding issue: {}".format(finding.issue))
+        raise Exception("Unknown finding issue: {}".format(finding.issue))
     config_settings = config[finding.issue]
     finding.severity = config_settings["severity"]
     finding.title = config_settings["title"]
@@ -56,13 +75,29 @@ def analyze_policy_string(
     include_community_auditors=False,
     config=None,
 ):
-    """Given a string reperesenting a policy, convert it to a Policy object with findings"""
+    """Given a string reperesenting a policy, convert it to a Policy object with findings
+
+    Each scan gets its own snapshot of the configuration so concurrent scans
+    (and later calls to override_config) cannot interfere with one another.
+    The optional `config` argument is merged on top of the default config;
+    when community auditors are enabled, their bundled overrides are applied
+    first so their findings resolve to a known issue.
+    """
+
+    scan_config = copy.deepcopy(globals()["config"])
+    if include_community_auditors:
+        community_auditors_override_file = (
+            Path(__file__).parent / "community_auditors" / "config_override.yaml"
+        )
+        override_config(community_auditors_override_file, scan_config)
+    if config is not None:
+        _merge_config(scan_config, config)
 
     try:
         # TODO Need to write my own json parser so I can track line numbers. See https://stackoverflow.com/questions/7225056/python-json-decoding-library-which-can-associate-decoded-items-with-original-li
         policy_json = jsoncfg.loads_config(policy_str)
     except jsoncfg.parser.JSONConfigParserException as e:
-        policy = Policy(None)
+        policy = Policy(None, filepath, scan_config)
         policy.add_finding(
             "MALFORMED_JSON",
             detail="json parsing error: {}".format(e),
@@ -70,7 +105,7 @@ def analyze_policy_string(
         )
         return policy
 
-    policy = Policy(policy_json, filepath, config)
+    policy = Policy(policy_json, filepath, scan_config)
     policy.analyze(
         ignore_private_auditors,
         private_auditors_custom_path,
@@ -279,7 +314,17 @@ def expand_action(action, raise_exceptions=True):
             "Unknown action {}:{}".format(prefix, unexpanded_action)
         )
 
-    return actions
+    # The IAM data can contain duplicate service entries (same prefix), which
+    # would otherwise yield duplicate actions. Dedupe while preserving order.
+    unique_actions = []
+    seen_actions = set()
+    for action in actions:
+        key = (action["service"], action["action"])
+        if key not in seen_actions:
+            seen_actions.add(key)
+            unique_actions.append(action)
+
+    return unique_actions
 
 
 def get_resource_type_matches_from_arn(arn):

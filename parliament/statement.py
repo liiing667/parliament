@@ -274,21 +274,16 @@ def translate_documentation_types(str):
 
 
 class Statement:
-    findings = []
-    resource_star = {}
-    effect_allow = True
-    stmt = None
-    sid = None
-    policy_id = None
-
-    _is_valid = True
-
     def set_policy_identifier(self, policy_id):
         self.policy_id = policy_id
 
     def __init__(self, stmt, analyze=True):
         self.findings = []
         self.resource_star = {}
+        self.effect_allow = True
+        self.sid = None
+        self.policy_id = None
+        self._is_valid = True
         self.stmt = stmt
         if analyze:
             if not self.analyze_statement():

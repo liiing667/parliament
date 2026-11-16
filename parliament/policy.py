@@ -7,25 +7,24 @@ import jsoncfg
 from glob import glob
 from pathlib import Path
 
-from . import expand_action
+from . import enhance_finding, expand_action
 from .finding import Finding
 from .misc import make_list
 from .statement import Statement
 
 
 class Policy:
-    _findings = []
-    policy_json = None
-    version = None
-    statements = []
-    policy = None
-
     def __init__(self, policy_json, filepath=None, config=None):
         self._findings = []
         self.statements = []
+        self.version = None
         self.policy_json = policy_json
         self.filepath = filepath
         self.config = config if config else {}
+
+    def enhance_finding(self, finding):
+        """Enhance a finding with this policy's scan configuration."""
+        return enhance_finding(finding, self.config)
 
     def add_finding(self, finding, detail="", location={}):
         if type(location) == tuple and "jsoncfg.config_classes" in str(
@@ -328,7 +327,12 @@ class Policy:
             # Run them
             for m in private_auditors:
                 logging.info(f"*** Checking with private auditor: {m}")
-                private_auditors[m].audit(self)
+                try:
+                    private_auditors[m].audit(self)
+                except Exception as e:
+                    self.add_finding(
+                        "EXCEPTION", detail=str(e), location={"private_auditor": m}
+                    )
 
         if include_community_auditors is True:
             # Import any private auditing modules
