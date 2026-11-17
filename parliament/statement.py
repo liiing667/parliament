@@ -11,7 +11,7 @@ from . import (
     UnknownPrefixException,
 )
 from .finding import Finding
-from .misc import make_list
+from .misc import make_list, normalize_location
 
 
 def is_condition_key_match(document_key, str):
@@ -399,34 +399,7 @@ class Statement:
         location: Dictionary with information about where this problem is. Often set to:
             {"location": "string"}
         """
-        if "jsoncfg.config_classes.ConfigJSONObject" in str(type(location)):
-            node_location = jsoncfg.node_location(location)
-            location = {"line": node_location.line, "column": node_location.column}
-        elif "jsoncfg.config_classes.ConfigJSONScalar" in str(type(location)):
-            node_location = jsoncfg.node_location(location)
-            location = {"string": location.value}
-            location["line"] = node_location.line
-            location["column"] = node_location.column
-        elif "tuple" in str(type(location)):
-            node_location = jsoncfg.node_location(location[1])
-            location = {"string": location[0]}
-            location["line"] = node_location.line
-            location["column"] = node_location.column
-        elif "jsoncfg.config_classes.ConfigJSONScalar" in str(
-            type(location.get("string", ""))
-        ):
-            node_location = jsoncfg.node_location(location["string"])
-            location["line"] = node_location.line
-            location["column"] = node_location.column
-            location["string"] = location["string"].value
-        elif "tuple" in str(type(location.get("string", ""))):
-            node_location = jsoncfg.node_location(location["string"][1])
-            location["line"] = node_location.line
-            location["column"] = node_location.column
-            location["string"] = location["string"][0]
-
-        elif "jsoncfg.config_classes" in str(type(location.get("string", ""))):
-            location["string"] = location["string"][0]
+        location = normalize_location(location)
 
         self.findings.append(Finding(finding, detail, location))
 

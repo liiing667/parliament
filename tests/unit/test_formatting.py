@@ -491,3 +491,61 @@ class TestFormatting:
         }"""
         )
         assert policy.finding_ids == set([]), "Policy is valid"
+
+    def test_unknown_top_level_element_keeps_analyzing_statements(self):
+        policy = analyze_policy_string(
+            """{
+    "Version": "2012-10-17",
+    "Bogus": {"nested": 1},
+    "Statement": {
+        "Effect": "Allow",
+        "Action": "*",
+        "Resource": "*"
+    }
+}""",
+            ignore_private_auditors=True,
+        )
+        assert policy.finding_ids == set(["MALFORMED"])
+        assert len(policy.statements) == 1, "Statement must still be analyzed"
+        assert policy.is_valid is False, "Local error must not look clean"
+
+        malformed = next(f for f in policy.findings if f.issue == "MALFORMED")
+        assert malformed.location["string"] == "Bogus"
+        assert malformed.location["line"] == 3
+        assert malformed.location["column"] == 14
+
+    def test_unknown_top_level_element_with_multiple_statements(self):
+        policy = analyze_policy_string(
+            """{
+    "Version": "2012-10-17",
+    "Bogus": 1,
+    "Statement": [
+        {"Effect": "Allow", "Action": "iam:listusers", "Resource": "*"},
+        {"Effect": "Allow", "Action": "iam:notarealaction", "Resource": "*"}
+    ]
+}""",
+            ignore_private_auditors=True,
+        )
+        assert policy.finding_ids == set(["MALFORMED", "UNKNOWN_ACTION"])
+        assert len(policy.statements) == 2
+        assert policy.is_valid is False
+
+    def test_unknown_statement_element_does_not_stop_sibling_analysis(self):
+        policy = analyze_policy_string(
+            """{
+    "Version": "2012-10-17",
+    "Statement": [
+        {"Effect": "Allow", "Action": "*", "Resource": "*", "Bogus": 1},
+        {"Effect": "Allow", "Action": "iam:listusers", "Resource": "*"}
+    ]
+}""",
+            ignore_private_auditors=True,
+        )
+        assert policy.finding_ids == set(["MALFORMED"])
+        assert len(policy.statements) == 2
+        assert policy.is_valid is False
+
+        malformed = next(f for f in policy.findings if f.issue == "MALFORMED")
+        assert malformed.location["string"] == "Bogus"
+        assert "line" in malformed.location
+        assert "column" in malformed.location
