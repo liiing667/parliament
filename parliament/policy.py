@@ -1,16 +1,75 @@
 import importlib
+import importlib.util
 import logging
 import os
 import pkgutil
 import sys
 import jsoncfg
-from glob import glob
 from pathlib import Path
 
 from . import expand_action
 from .finding import Finding
 from .misc import make_list
 from .statement import Statement
+
+
+def _load_private_auditors(private_auditors_directory_path):
+    """
+    Explicit boundary for loading private auditor modules.
+
+    - Only ``*.py`` files directly inside the resolved auditor directory are
+      considered; nothing else on ``sys.path`` is consulted.
+    - Each file is executed in its own module namespace with a name that
+      cannot collide with (or be resolved through) real packages.
+    - A failure to import one auditor is contained: it is reported in the
+      returned ``errors`` list and does not prevent the remaining auditors
+      from loading.
+    - Shared interpreter state is never permanently modified: the auditor
+      directory is placed on ``sys.path`` only for the duration of the
+      imports (so trusted multi-file extensions keep working) and is always
+      removed afterwards, even on failure.
+
+    Returns a tuple of (auditors, errors) where auditors maps the auditor
+    name to its module and errors is a list of (name, exception) tuples.
+    """
+    auditors = {}
+    errors = []
+
+    directory = Path(private_auditors_directory_path).resolve()
+    if not directory.is_dir():
+        return auditors, errors
+
+    auditor_files = sorted(
+        path
+        for path in directory.glob("*.py")
+        if path.name != "__init__.py" and path.is_file()
+    )
+
+    sys.path.insert(0, str(directory))
+    try:
+        for path in auditor_files:
+            auditor_name = path.stem
+            # Use a flat, parliament-specific module name so the auditor can
+            # never shadow or be confused with an importable package.
+            module_name = "_parliament_private_auditor_{}".format(auditor_name)
+            try:
+                module_spec = importlib.util.spec_from_file_location(
+                    module_name, str(path)
+                )
+                if module_spec is None or module_spec.loader is None:
+                    raise ImportError(
+                        "Could not create an import spec for {}".format(path)
+                    )
+                module = importlib.util.module_from_spec(module_spec)
+                module_spec.loader.exec_module(module)
+            except Exception as e:
+                errors.append((auditor_name, e))
+                continue
+            auditors[auditor_name] = module
+    finally:
+        sys.path.remove(str(directory))
+
+    return auditors, errors
 
 
 class Policy:
@@ -298,27 +357,27 @@ class Policy:
 
             if private_auditors_custom_path is not None:
                 private_auditors_directory_path = private_auditors_custom_path
-                # Ensure we can import from this directory
-                sys.path.append(".")
 
-            private_auditors = {}
+            private_auditors, load_errors = _load_private_auditors(
+                private_auditors_directory_path
+            )
 
-            for path in glob(f"{private_auditors_directory_path}/*.py"):
-                if path.endswith("__init__.py"):
-                    continue
-
-                package_name = "private_auditors"
-                module_name = Path(path).stem
-
-                module_spec = importlib.util.spec_from_file_location(
-                    f"{package_name}.{module_name}", path
+            # A failing auditor is contained: record it as a finding instead
+            # of aborting the analysis of the policy.
+            for auditor_name, error in load_errors:
+                self.add_finding(
+                    "EXCEPTION",
+                    detail="Failed to load private auditor {}: {}".format(
+                        auditor_name, error
+                    ),
+                    location={"private_auditor": auditor_name},
                 )
-                module = importlib.util.module_from_spec(module_spec)
-                module_spec.loader.exec_module(module)
 
-                private_auditors[module_name] = module
-
-            if len(private_auditors) == 0 and private_auditors_custom_path is not None:
+            if (
+                len(private_auditors) == 0
+                and len(load_errors) == 0
+                and private_auditors_custom_path is not None
+            ):
                 raise Exception(
                     "No private auditors found at {}".format(
                         private_auditors_custom_path
@@ -328,7 +387,14 @@ class Policy:
             # Run them
             for m in private_auditors:
                 logging.info(f"*** Checking with private auditor: {m}")
-                private_auditors[m].audit(self)
+                try:
+                    private_auditors[m].audit(self)
+                except Exception as e:
+                    self.add_finding(
+                        "EXCEPTION",
+                        detail=str(e),
+                        location={"private_auditor": m},
+                    )
 
         if include_community_auditors is True:
             # Import any private auditing modules
