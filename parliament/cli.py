@@ -17,9 +17,44 @@ from parliament import (
     config,
     __version__,
 )
+from parliament.policy import Policy
 from parliament.misc import make_list
 
 logger = logging.getLogger(__name__)
+
+
+def analyze_policy_safely(
+    policy_string,
+    file_path=None,
+    private_auditors_custom_path=None,
+    include_community_auditors=False,
+    config=None,
+):
+    """Analyze one policy without ever letting an exception escape.
+
+    Returns a (policy, error_occurred) tuple. An exception while loading or
+    analyzing a single policy is converted into an EXCEPTION finding scoped to
+    that policy, so one broken file can never cause other policies to be
+    silently skipped or the overall run to report success.
+    """
+    try:
+        policy = analyze_policy_string(
+            policy_string,
+            file_path,
+            private_auditors_custom_path=private_auditors_custom_path,
+            include_community_auditors=include_community_auditors,
+            config=config,
+        )
+        return policy, bool(getattr(policy, "error_occurred", False))
+    except Exception as e:
+        policy = Policy(None, filepath=file_path, config=config)
+        policy.add_finding(
+            "EXCEPTION",
+            detail="Policy could not be analyzed: {}".format(e),
+            location={"filepath": file_path},
+        )
+        policy.error_occurred = True
+        return policy, True
 
 
 def is_finding_filtered(finding, minimum_severity="LOW"):
@@ -121,8 +156,6 @@ def find_files(directory, exclude_pattern=None, policy_extension=""):
 
 
 def main(argv):
-    with open("/tmp/parliament.log", "w") as fout:
-        fout.write(f"Argv: {argv}\n")
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--aws-managed-policies",
@@ -204,9 +237,6 @@ def main(argv):
     )
     args = parser.parse_args(args=argv[1:])
 
-    with open("/tmp/parliament.log", "a") as fout:
-        fout.write(f"Files: {args.files}\n")
-
     log_level = logging.ERROR
     log_format = "%(message)s"
 
@@ -232,6 +262,7 @@ def main(argv):
 
     # Change the exit status if there are errors
     findings = []
+    analysis_errors = 0
 
     if args.include_community_auditors:
         community_auditors_directory = "community_auditors"
@@ -250,13 +281,14 @@ def main(argv):
                 contents = f.read()
                 policy_file_json = jsoncfg.loads_config(contents)
                 policy_string = json.dumps(policy_file_json.PolicyVersion.Document())
-                policy = analyze_policy_string(
+                policy, error_occurred = analyze_policy_safely(
                     policy_string,
                     file_path,
                     private_auditors_custom_path=args.private_auditors,
                     include_community_auditors=args.include_community_auditors,
                     config=config,
                 )
+                analysis_errors += int(error_occurred)
                 findings.extend(policy.findings)
 
     elif args.auth_details_file:
@@ -281,75 +313,80 @@ def main(argv):
                 for version in policy.PolicyVersionList:
                     if not version.IsDefaultVersion():
                         continue
-                    policy = analyze_policy_string(
+                    analyzed_policy, error_occurred = analyze_policy_safely(
                         json.dumps(version.Document()),
                         policy.Arn(),
                     )
-                    findings.extend(policy.findings)
+                    analysis_errors += int(error_occurred)
+                    findings.extend(analyzed_policy.findings)
 
             # Review the inline policies on Users, Roles, and Groups
             for user in auth_details_json.UserDetailList:
                 for policy in user.UserPolicyList([]):
-                    policy = analyze_policy_string(
+                    analyzed_policy, error_occurred = analyze_policy_safely(
                         json.dumps(policy["PolicyDocument"]),
                         user.Arn(),
                         private_auditors_custom_path=args.private_auditors,
                         include_community_auditors=args.include_community_auditors,
                         config=config,
                     )
-                    findings.extend(policy.findings)
+                    analysis_errors += int(error_occurred)
+                    findings.extend(analyzed_policy.findings)
             for role in auth_details_json.RoleDetailList:
                 for policy in role.RolePolicyList([]):
-                    policy = analyze_policy_string(
+                    analyzed_policy, error_occurred = analyze_policy_safely(
                         json.dumps(policy["PolicyDocument"]),
                         role.Arn(),
                         private_auditors_custom_path=args.private_auditors,
                         include_community_auditors=args.include_community_auditors,
                         config=config,
                     )
-                    findings.extend(policy.findings)
+                    analysis_errors += int(error_occurred)
+                    findings.extend(analyzed_policy.findings)
             for group in auth_details_json.GroupDetailList:
                 for policy in group.GroupPolicyList([]):
-                    policy = analyze_policy_string(
+                    analyzed_policy, error_occurred = analyze_policy_safely(
                         json.dumps(policy["PolicyDocument"]),
                         group.Arn(),
                         private_auditors_custom_path=args.private_auditors,
                         include_community_auditors=args.include_community_auditors,
                         config=config,
                     )
-                    findings.extend(policy.findings)
+                    analysis_errors += int(error_occurred)
+                    findings.extend(analyzed_policy.findings)
     elif args.string:
-        policy = analyze_policy_string(
+        policy, error_occurred = analyze_policy_safely(
             args.string,
             private_auditors_custom_path=args.private_auditors,
             include_community_auditors=args.include_community_auditors,
             config=config,
         )
+        analysis_errors += int(error_occurred)
         findings.extend(policy.findings)
     elif args.files and not args.directory:
         for file_path in (stripped_path for path in args.files.split(",") if (stripped_path := path.strip())):
             path = Path(file_path)
             contents = path.read_text()
-            with open("/tmp/parliament.log", "a") as fout:
-                fout.write(f"Path: {path}\nContents: {contents}\n")
-            policy = analyze_policy_string(
+            policy, error_occurred = analyze_policy_safely(
                 contents,
                 file_path,
                 private_auditors_custom_path=args.private_auditors,
                 include_community_auditors=args.include_community_auditors,
                 config=config,
             )
+            analysis_errors += int(error_occurred)
             findings.extend(policy.findings)
     elif args.file and not args.directory:
         contents = args.file.read()
         args.file.close()
-        policy = analyze_policy_string(
+        policy, error_occurred = analyze_policy_safely(
             contents,
             args.file.name,
             private_auditors_custom_path=args.private_auditors,
             include_community_auditors=args.include_community_auditors,
             config=config,
         )
+        analysis_errors += int(error_occurred)
         findings.extend(policy.findings)
     elif args.directory:
         file_paths = find_files(
@@ -360,13 +397,14 @@ def main(argv):
         for file_path in file_paths:
             with open(file_path) as f:
                 contents = f.read()
-                policy = analyze_policy_string(
+                policy, error_occurred = analyze_policy_safely(
                     contents,
                     file_path,
                     private_auditors_custom_path=args.private_auditors,
                     include_community_auditors=args.include_community_auditors,
                     config=config,
                 )
+                analysis_errors += int(error_occurred)
                 findings.extend(policy.findings)
     else:
         parser.print_help()
@@ -374,9 +412,25 @@ def main(argv):
 
     filtered_findings = []
     for finding in findings:
-        finding = enhance_finding(finding)
+        try:
+            finding = enhance_finding(finding)
+        except Exception as e:
+            # An unregistered/unknown issue (for example one emitted by a
+            # private auditor with a custom config) must not crash reporting
+            # or be silently dropped. Emit it as-is and keep the run failing.
+            analysis_errors += 1
+            logger.error("Could not enhance finding '%s': %s", finding.issue, e)
+            filtered_findings.append(finding)
+            continue
         if not is_finding_filtered(finding, args.minimum_severity):
             filtered_findings.append(finding)
+
+    if analysis_errors > 0:
+        # Fail closed: any auditor/analysis error means the run cannot vouch
+        # for the policies, even if the finding was muted or filtered away.
+        for finding in filtered_findings:
+            print_finding(finding, args.minimal, args.json)
+        return 1
 
     if len(filtered_findings) == 0:
         # Return with exit code 0 if no findings

@@ -274,22 +274,19 @@ def translate_documentation_types(str):
 
 
 class Statement:
-    findings = []
-    resource_star = {}
-    effect_allow = True
-    stmt = None
-    sid = None
-    policy_id = None
-
-    _is_valid = True
-
     def set_policy_identifier(self, policy_id):
         self.policy_id = policy_id
 
     def __init__(self, stmt, analyze=True):
+        # Per-instance state. Class-level mutable defaults would otherwise let
+        # statements from different policies share findings/resource_star.
         self.findings = []
         self.resource_star = {}
+        self.effect_allow = True
         self.stmt = stmt
+        self.sid = None
+        self.policy_id = None
+        self._is_valid = True
         if analyze:
             if not self.analyze_statement():
                 # Statement is malformed
@@ -302,6 +299,10 @@ class Statement:
     @property
     def is_valid(self):
         return self._is_valid
+
+    @property
+    def finding_ids(self):
+        return {finding.issue for finding in self.findings}
 
     def in_actions(self, privilege_prefix, privilege_name):
         """
@@ -536,40 +537,119 @@ class Statement:
             for v in make_list(block[1]):
                 values.append(v.value)
 
-            # Check for known bad pattern
-            if operator.lower() == "bool":
-                if (
-                    key.lower() == "aws:MultiFactorAuthPresent".lower()
-                    and "false" in values
-                ):
+            try:
+                self._evaluate_condition_block(
+                    operator,
+                    operator_type_requirement,
+                    block,
+                    key,
+                    values,
+                    expanded_actions,
+                    condition_block,
+                )
+            except Exception as e:
+                # A failure evaluating one condition key must not abort the
+                # remaining checks or let the policy be treated as passing.
+                self.add_finding(
+                    "EXCEPTION",
+                    detail="Error while evaluating condition '{}' with operator '{}': {}".format(
+                        key, operator, e
+                    ),
+                    location=condition_block,
+                )
+
+        return
+
+    def _evaluate_condition_block(
+        self,
+        operator,
+        operator_type_requirement,
+        block,
+        key,
+        values,
+        expanded_actions,
+        condition_block,
+    ):
+        """Evaluate a single condition key within a condition block."""
+
+        # Check for known bad pattern
+        if operator.lower() == "bool":
+            if (
+                key.lower() == "aws:MultiFactorAuthPresent".lower()
+                and "false" in values
+            ):
+                self.add_finding(
+                    "BAD_PATTERN_FOR_MFA",
+                    detail='The condition {"Bool": {"aws:MultiFactorAuthPresent":"false"}} is bad because aws:MultiFactorAuthPresent may not exist so it does not enforce MFA. You likely want to use a Deny with BoolIfExists.',
+                    location=condition_block,
+                )
+        elif operator.lower() == "null":
+            if (
+                key.lower == "aws:MultiFactorAuthPresent".lower()
+                and "false" in values
+            ):
+                self.add_finding(
+                    "BAD_PATTERN_FOR_MFA",
+                    detail='The condition {"Null": {"aws:MultiFactorAuthPresent":"false"}} is bad because aws:MultiFactorAuthPresent it does not enforce MFA, and only checks if the value exists. You likely want to use an Allow with {"Bool": {"aws:MultiFactorAuthPresent":"true"}}.',
+                    location=condition_block,
+                )
+
+        if operator.lower() in ["null"]:
+            # The following condition is valid:
+            # "Condition": { "Null": { "aws:MultiFactorAuthAge": true }
+            # If we check further we'll get a MISMATCHED_TYPE finding due to
+            # aws:MultiFactorAuthAge being checked against a bool value instead of a date
+            return
+
+        # The key here from the example is "s3:prefix"
+        condition_type = get_global_key_type(key)
+        if condition_type:
+            # This is a global key, like aws:CurrentTime
+            # Check if the values match the type (ex. must all be Date values)
+            if not is_value_in_correct_format_for_type(condition_type, values):
+                self.add_finding(
+                    "MISMATCHED_TYPE",
+                    detail="Type mismatch: {} requires a value of type {} but given {}".format(
+                        key, condition_type, values
+                    ),
+                    location=condition_block,
+                )
+        else:
+            # See if this is a service specific key
+            for action_struct in expanded_actions:
+                privilege_info = get_privilege_info(
+                    action_struct["service"], action_struct["action"]
+                )
+
+                # Ensure the condition_key exists
+                match = None
+                for resource_type in privilege_info["resource_types"]:
+                    for condition_key in resource_type["condition_keys"]:
+                        if is_condition_key_match(condition_key, key):
+                            match = condition_key
+
+                if match is None:
                     self.add_finding(
-                        "BAD_PATTERN_FOR_MFA",
-                        detail='The condition {"Bool": {"aws:MultiFactorAuthPresent":"false"}} is bad because aws:MultiFactorAuthPresent may not exist so it does not enforce MFA. You likely want to use a Deny with BoolIfExists.',
+                        "UNKNOWN_CONDITION_FOR_ACTION",
+                        detail="Unknown condition {} for action {}:{}".format(
+                            key, action_struct["service"], action_struct["action"]
+                        ),
                         location=condition_block,
                     )
-            elif operator.lower() == "null":
-                if (
-                    key.lower == "aws:MultiFactorAuthPresent".lower()
-                    and "false" in values
-                ):
-                    self.add_finding(
-                        "BAD_PATTERN_FOR_MFA",
-                        detail='The condition {"Null": {"aws:MultiFactorAuthPresent":"false"}} is bad because aws:MultiFactorAuthPresent it does not enforce MFA, and only checks if the value exists. You likely want to use an Allow with {"Bool": {"aws:MultiFactorAuthPresent":"true"}}.',
-                        location=condition_block,
+                    continue
+
+                condition_type = None
+                for condition in privilege_info["service_conditions"]:
+                    if condition["condition"] == match:
+                        condition_type = condition["type"]
+
+                if condition_type is None:
+                    raise Exception(
+                        "Action condition not found in service definition for {}".format(
+                            match
+                        )
                     )
 
-            if operator.lower() in ["null"]:
-                # The following condition is valid:
-                # "Condition": { "Null": { "aws:MultiFactorAuthAge": true }
-                # If we check further we'll get a MISMATCHED_TYPE finding due to
-                # aws:MultiFactorAuthAge being checked against a bool value instead of a date
-                continue
-
-            # The key here from the example is "s3:prefix"
-            condition_type = get_global_key_type(key)
-            if condition_type:
-                # This is a global key, like aws:CurrentTime
-                # Check if the values match the type (ex. must all be Date values)
                 if not is_value_in_correct_format_for_type(condition_type, values):
                     self.add_finding(
                         "MISMATCHED_TYPE",
@@ -578,81 +658,37 @@ class Statement:
                         ),
                         location=condition_block,
                     )
-            else:
-                # See if this is a service specific key
-                for action_struct in expanded_actions:
-                    privilege_info = get_privilege_info(
-                        action_struct["service"], action_struct["action"]
-                    )
 
-                    # Ensure the condition_key exists
-                    match = None
-                    for resource_type in privilege_info["resource_types"]:
-                        for condition_key in resource_type["condition_keys"]:
-                            if is_condition_key_match(condition_key, key):
-                                match = condition_key
-
-                    if match is None:
+            if condition_type is not None:
+                # if operator_type_requirement.lower() == 'string' and condition_type.lower() = 'arn':
+                #     # Ignore these.
+                #     pass
+                documenation_condition_type = translate_documentation_types(
+                    condition_type
+                )
+                if operator_type_requirement != documenation_condition_type:
+                    if (
+                        operator_type_requirement == "String"
+                        and documenation_condition_type == "Arn"
+                    ):
                         self.add_finding(
-                            "UNKNOWN_CONDITION_FOR_ACTION",
-                            detail="Unknown condition {} for action {}:{}".format(
-                                key, action_struct["service"], action_struct["action"]
+                            "MISMATCHED_TYPE_BUT_USABLE",
+                            detail="Type mismatch: {} requires a value of type {} but given {}".format(
+                                operator,
+                                operator_type_requirement,
+                                translate_documentation_types(condition_type),
                             ),
                             location=condition_block,
                         )
-                        continue
-
-                    condition_type = None
-                    for condition in privilege_info["service_conditions"]:
-                        if condition["condition"] == match:
-                            condition_type = condition["type"]
-
-                    if condition_type is None:
-                        raise Exception(
-                            "Action condition not found in service definition for {}".format(
-                                match
-                            )
-                        )
-
-                    if not is_value_in_correct_format_for_type(condition_type, values):
+                    else:
                         self.add_finding(
                             "MISMATCHED_TYPE",
                             detail="Type mismatch: {} requires a value of type {} but given {}".format(
-                                key, condition_type, values
+                                operator,
+                                operator_type_requirement,
+                                translate_documentation_types(condition_type),
                             ),
                             location=condition_block,
-                        )
-
-                if condition_type is not None:
-                    # if operator_type_requirement.lower() == 'string' and condition_type.lower() = 'arn':
-                    #     # Ignore these.
-                    #     pass
-                    documenation_condition_type = translate_documentation_types(
-                        condition_type
-                    )
-                    if operator_type_requirement != documenation_condition_type:
-                        if (
-                            operator_type_requirement == "String"
-                            and documenation_condition_type == "Arn"
-                        ):
-                            self.add_finding(
-                                "MISMATCHED_TYPE_BUT_USABLE",
-                                detail="Type mismatch: {} requires a value of type {} but given {}".format(
-                                    operator,
-                                    operator_type_requirement,
-                                    translate_documentation_types(condition_type),
-                                ),
-                                location=condition_block,
-                            )
-                        else:
-                            self.add_finding(
-                                "MISMATCHED_TYPE",
-                                detail="Type mismatch: {} requires a value of type {} but given {}".format(
-                                    operator,
-                                    operator_type_requirement,
-                                    translate_documentation_types(condition_type),
-                                ),
-                                location=condition_block,
                             )
 
         return

@@ -1,8 +1,8 @@
 import importlib
+import hashlib
 import logging
 import os
 import pkgutil
-import sys
 import jsoncfg
 from glob import glob
 from pathlib import Path
@@ -14,20 +14,23 @@ from .statement import Statement
 
 
 class Policy:
-    _findings = []
-    policy_json = None
-    version = None
-    statements = []
-    policy = None
-
     def __init__(self, policy_json, filepath=None, config=None):
+        # Per-instance state. Class-level mutable defaults would otherwise let
+        # policies analyzed in the same process share findings and statements.
         self._findings = []
         self.statements = []
         self.policy_json = policy_json
         self.filepath = filepath
         self.config = config if config else {}
+        self.version = None
+        self.policy = None
+        # Tracks any analysis/auditor error so callers can fail closed even if
+        # a config override mutes or filters the corresponding finding.
+        self.error_occurred = False
 
     def add_finding(self, finding, detail="", location={}):
+        if finding == "EXCEPTION":
+            self.error_occurred = True
         if type(location) == tuple and "jsoncfg.config_classes" in str(
             type(location[1])
         ):
@@ -42,6 +45,11 @@ class Policy:
             location_data["lineno"] = jsoncfg.node_location(location).line
             location_data["column"] = jsoncfg.node_location(location).column
             location = location_data
+        elif "ConfigJSONObject" in str(type(location)):
+            node_location = jsoncfg.node_location(location)
+            location = {"line": node_location.line, "column": node_location.column}
+        elif not isinstance(location, dict):
+            location = {"location": str(location)}
         if "filepath" not in location:
             location["filepath"] = self.filepath
         self._findings.append(Finding(finding, detail, location))
@@ -266,8 +274,21 @@ class Policy:
         sids = {}
         stmts_json = make_list(self.policy_json["Statement"])
         for stmt_json in stmts_json:
-            stmt = Statement(stmt_json)
+            try:
+                stmt = Statement(stmt_json)
+            except Exception as e:
+                # One unparseable statement must not abort the remaining
+                # statements or let the overall scan exit successfully.
+                self.add_finding(
+                    "EXCEPTION",
+                    detail="Error while evaluating a statement: {}".format(e),
+                    location=stmt_json,
+                )
+                continue
             self.statements.append(stmt)
+
+            if "EXCEPTION" in stmt.finding_ids:
+                self.error_occurred = True
 
             # Report duplicate Statement Ids
             if stmt.sid is not None:
@@ -287,48 +308,36 @@ class Policy:
             return False
 
         # Look for bad patterns
-        self.check_for_bad_patterns()
-
-        if not ignore_private_auditors:
-            # Import any private auditing modules
-            private_auditors_directory = "private_auditors"
-            private_auditors_directory_path = (
-                Path(os.path.abspath(__file__)).parent / private_auditors_directory
+        try:
+            self.check_for_bad_patterns()
+        except Exception as e:
+            self.add_finding(
+                "EXCEPTION",
+                detail="Error while checking for bad patterns: {}".format(e),
             )
 
-            if private_auditors_custom_path is not None:
-                private_auditors_directory_path = private_auditors_custom_path
-                # Ensure we can import from this directory
-                sys.path.append(".")
+        if not ignore_private_auditors:
+            private_auditors = self._load_private_auditors(
+                private_auditors_custom_path
+            )
 
-            private_auditors = {}
-
-            for path in glob(f"{private_auditors_directory_path}/*.py"):
-                if path.endswith("__init__.py"):
-                    continue
-
-                package_name = "private_auditors"
-                module_name = Path(path).stem
-
-                module_spec = importlib.util.spec_from_file_location(
-                    f"{package_name}.{module_name}", path
+            # Run them. Each auditor is an isolated failure boundary: an
+            # exception in one auditor must not run other auditors or the
+            # policy analysis silently past it, and must never propagate.
+            for auditor_name, module in private_auditors.items():
+                logging.info(
+                    "*** Checking with private auditor: {}".format(auditor_name)
                 )
-                module = importlib.util.module_from_spec(module_spec)
-                module_spec.loader.exec_module(module)
-
-                private_auditors[module_name] = module
-
-            if len(private_auditors) == 0 and private_auditors_custom_path is not None:
-                raise Exception(
-                    "No private auditors found at {}".format(
-                        private_auditors_custom_path
+                try:
+                    module.audit(self)
+                except Exception as e:
+                    self.add_finding(
+                        "EXCEPTION",
+                        detail="Private auditor '{}' failed: {}".format(
+                            auditor_name, e
+                        ),
+                        location={"private_auditor": auditor_name},
                     )
-                )
-
-            # Run them
-            for m in private_auditors:
-                logging.info(f"*** Checking with private auditor: {m}")
-                private_auditors[m].audit(self)
 
         if include_community_auditors is True:
             # Import any private auditing modules
@@ -363,3 +372,70 @@ class Policy:
                     )
 
         return True
+
+    def _load_private_auditors(self, private_auditors_custom_path):
+        """Discover and load private auditor modules with isolated identities.
+
+        Auditors are loaded by file location into unique module names derived
+        from the resolved directory. They are never registered in sys.modules
+        and no directory is added to sys.path, so an untrusted auditor cannot
+        shadow imports of another auditor or of parliament itself, and two
+        directories containing same-named files keep distinct identities.
+        """
+        private_auditors_directory = "private_auditors"
+        if private_auditors_custom_path is not None:
+            private_auditors_directory_path = Path(
+                private_auditors_custom_path
+            ).resolve()
+        else:
+            private_auditors_directory_path = (
+                Path(os.path.abspath(__file__)).parent / private_auditors_directory
+            )
+
+        private_auditors = {}
+        for path in sorted(
+            glob(os.path.join(str(private_auditors_directory_path), "*.py"))
+        ):
+            if path.endswith("__init__.py"):
+                continue
+
+            module_name = Path(path).stem
+            resolved_path = str(Path(path).resolve())
+            identity = hashlib.sha256(resolved_path.encode("utf-8")).hexdigest()[:16]
+            unique_module_name = "parliament_private_auditor_{}_{}".format(
+                identity, module_name
+            )
+
+            try:
+                module_spec = importlib.util.spec_from_file_location(
+                    unique_module_name, resolved_path
+                )
+                module = importlib.util.module_from_spec(module_spec)
+                module_spec.loader.exec_module(module)
+            except Exception as e:
+                self.add_finding(
+                    "EXCEPTION",
+                    detail="Private auditor '{}' could not be loaded: {}".format(
+                        module_name, e
+                    ),
+                    location={"private_auditor": module_name},
+                )
+                continue
+
+            private_auditors[module_name] = module
+
+        if (
+            len(private_auditors) == 0
+            and private_auditors_custom_path is not None
+        ):
+            self.add_finding(
+                "EXCEPTION",
+                detail="No private auditors found at {}".format(
+                    private_auditors_custom_path
+                ),
+                location={
+                    "private_auditors_path": str(private_auditors_directory_path)
+                },
+            )
+
+        return private_auditors
