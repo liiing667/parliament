@@ -6,6 +6,7 @@ __version__ = "1.6.4"
 
 import fnmatch
 import functools
+import copy
 import json
 import jsoncfg
 import re
@@ -41,11 +42,19 @@ def enhance_finding(finding):
     if finding.issue not in config:
         raise Exception("Uknown finding issue: {}".format(finding.issue))
     config_settings = config[finding.issue]
-    finding.severity = config_settings["severity"]
-    finding.title = config_settings["title"]
-    finding.description = config_settings.get("description", "")
-    finding.ignore_locations = config_settings.get("ignore_locations", None)
-    return finding
+    # Never mutate the original finding: the same Finding instance may be
+    # consumed by several reporters (text/json/minimal), and mutating it here
+    # made severity/ignore state depend on which path ran first. Return a
+    # distinct, fully populated copy instead.
+    enhanced_finding = copy.copy(finding)
+    enhanced_finding.location = copy.deepcopy(finding.location)
+    enhanced_finding.severity = config_settings["severity"]
+    enhanced_finding.title = config_settings["title"]
+    enhanced_finding.description = config_settings.get("description", "")
+    enhanced_finding.ignore_locations = config_settings.get(
+        "ignore_locations", None
+    )
+    return enhanced_finding
 
 
 def analyze_policy_string(
@@ -62,12 +71,13 @@ def analyze_policy_string(
         # TODO Need to write my own json parser so I can track line numbers. See https://stackoverflow.com/questions/7225056/python-json-decoding-library-which-can-associate-decoded-items-with-original-li
         policy_json = jsoncfg.loads_config(policy_str)
     except jsoncfg.parser.JSONConfigParserException as e:
-        policy = Policy(None)
+        policy = Policy(None, filepath, config)
         policy.add_finding(
             "MALFORMED_JSON",
             detail="json parsing error: {}".format(e),
             location={"line": e.line, "column": e.column},
         )
+        policy.enhance_findings()
         return policy
 
     policy = Policy(policy_json, filepath, config)
@@ -76,6 +86,7 @@ def analyze_policy_string(
         private_auditors_custom_path,
         include_community_auditors,
     )
+    policy.enhance_findings()
     return policy
 
 
@@ -279,7 +290,19 @@ def expand_action(action, raise_exceptions=True):
             "Unknown action {}:{}".format(prefix, unexpanded_action)
         )
 
-    return actions
+    # The IAM definition can contain several entries that share the same
+    # service prefix (for example two "iam" services); each action must still
+    # be reported exactly once regardless of how many definitions match.
+    unique_actions = []
+    seen_actions = set()
+    for action in actions:
+        action_key = (action["service"], action["action"])
+        if action_key in seen_actions:
+            continue
+        seen_actions.add(action_key)
+        unique_actions.append(action)
+
+    return unique_actions
 
 
 def get_resource_type_matches_from_arn(arn):

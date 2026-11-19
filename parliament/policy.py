@@ -3,12 +3,14 @@ import logging
 import os
 import pkgutil
 import sys
+import copy
 import jsoncfg
 from glob import glob
 from pathlib import Path
 
-from . import expand_action
+from . import expand_action, enhance_finding
 from .finding import Finding
+from .finding import dedupe_findings
 from .misc import make_list
 from .statement import Statement
 
@@ -25,7 +27,10 @@ class Policy:
         self.statements = []
         self.policy_json = policy_json
         self.filepath = filepath
-        self.config = config if config else {}
+        # Snapshot the config so later override_config() calls (for example
+        # when another policy is analyzed in the same process) cannot change
+        # the severity/identity of findings already produced by this policy.
+        self.config = copy.deepcopy(config) if config else {}
 
     def add_finding(self, finding, detail="", location={}):
         if type(location) == tuple and "jsoncfg.config_classes" in str(
@@ -48,8 +53,7 @@ class Policy:
 
     @property
     def findings(self):
-        all_findings = []
-        all_findings.extend(self._findings)
+        all_findings = list(self._findings)
 
         for stmt in self.statements:
             for finding in stmt.findings:
@@ -58,7 +62,44 @@ class Policy:
 
                 all_findings.append(finding)
 
-        return all_findings
+        # The same problem can be reported by more than one path (built-in
+        # checks, private auditors, community auditors). Collapse identical
+        # findings so every consumer sees one finding per unique problem.
+        return dedupe_findings(all_findings)
+
+    def enhance_findings(self):
+        """Resolve severity/title/description/ignore config exactly once.
+
+        Enhancement is idempotent and uses this policy's config snapshot, so
+        the result is identical no matter which reporter or CLI output format
+        consumes the findings.
+        """
+        enhanced_policy_findings = []
+        for finding in self._findings:
+            if finding.severity:
+                enhanced_policy_findings.append(finding)
+                continue
+            try:
+                enhanced_policy_findings.append(enhance_finding(finding))
+            except Exception:
+                # Keep the original finding if the issue has no config entry;
+                # reporters must not crash just because of an unknown issue.
+                enhanced_policy_findings.append(finding)
+        self._findings = enhanced_policy_findings
+
+        for stmt in self.statements:
+            enhanced_statement_findings = []
+            for finding in stmt.findings:
+                if finding.severity:
+                    enhanced_statement_findings.append(finding)
+                    continue
+                try:
+                    enhanced_statement_findings.append(enhance_finding(finding))
+                except Exception:
+                    enhanced_statement_findings.append(finding)
+            stmt.findings = enhanced_statement_findings
+
+        return self.findings
 
     @property
     def finding_ids(self):

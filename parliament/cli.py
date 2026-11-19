@@ -12,12 +12,11 @@ from pathlib import Path
 
 from parliament import (
     analyze_policy_string,
-    enhance_finding,
     override_config,
     config,
     __version__,
 )
-from parliament.misc import make_list
+from parliament.finding import dedupe_findings
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +25,11 @@ def is_finding_filtered(finding, minimum_severity="LOW"):
     # Return True if the finding should be filtered (ie. return False if it should be displayed)
     minimum_severity = minimum_severity.upper()
     severity_choices = ["MUTE", "INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
-    if severity_choices.index(finding.severity) < severity_choices.index(
+    # Findings are enhanced at analysis time, but guard against an
+    # unenhanced/unknown issue so the exit code never depends on the order in
+    # which reporting and filtering run.
+    finding_severity = finding.severity if finding.severity else "LOW"
+    if severity_choices.index(finding_severity) < severity_choices.index(
         minimum_severity
     ):
         return True
@@ -54,7 +57,14 @@ def is_finding_filtered(finding, minimum_severity="LOW"):
             all_match = True
             for location_type, locations_to_ignore in ignore_location.items():
                 has_array_match = False
-                for location_to_ignore in make_list(locations_to_ignore):
+                # ignore_locations come from a YAML config, so values are
+                # plain Python strings/lists - make_list() only understands
+                # jsoncfg nodes and silently returns [] for plain strings.
+                if isinstance(locations_to_ignore, (list, tuple)):
+                    locations_to_check = list(locations_to_ignore)
+                else:
+                    locations_to_check = [locations_to_ignore]
+                for location_to_ignore in locations_to_check:
                     if re.fullmatch(
                         location_to_ignore.lower(),
                         str(finding.location.get(location_type, "")).lower(),
@@ -372,9 +382,14 @@ def main(argv):
         parser.print_help()
         return -1
 
+    # Finding identity and severity are already resolved once during
+    # analyze_policy_string(); dedupe again across the analyzed policies so
+    # the same problem reported through different paths cannot appear twice,
+    # be suppressed for one output but not another, or flip the exit code.
+    findings = dedupe_findings(findings)
+
     filtered_findings = []
     for finding in findings:
-        finding = enhance_finding(finding)
         if not is_finding_filtered(finding, args.minimum_severity):
             filtered_findings.append(finding)
 
