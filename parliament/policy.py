@@ -127,43 +127,90 @@ class Policy:
           this would only return "arn:aws:s3:::examplebucket/*" because that is the only object resource.
         """
 
-        def __is_allowed(stmts):
-            """
-            Given statements that are all relevant to the same resource and privilege,
-            (meaning each statement must have an explicit allow or deny on the privilege)
-            determine if it is allowed, which means no Deny effects.
-            """
-            has_allow = False
-            for stmt in stmts:
-                if stmt.effect_allow:
-                    has_allow = True
-                else:
-                    # If there is a Condition in the Deny, we don't count this as Deny'ing the action
-                    # entirely so skip it
-                    if "Condition" in stmt.stmt:
-                        continue
-                    return False
-            return has_allow
+        all_references = self.get_references(privilege_prefix, privilege_name)
+
+        # An explicit, unconditional Deny of the privilege on "*" denies it for
+        # every possible resource. Only a Deny that directly matches the
+        # privilege through its Action element counts here: a Deny guarded by a
+        # Condition or expressed with NotAction may not apply at evaluation
+        # time, so it must not suppress the conclusion for other resources.
+        # The check is order independent, since it only asks whether such a
+        # statement exists and does not stop evaluating the remaining statements.
+        if "*" in all_references:
+            for stmt in all_references["*"]:
+                if (
+                    not stmt.effect_allow
+                    and self.__is_unconditional_deny(
+                        stmt, privilege_prefix, privilege_name
+                    )
+                ):
+                    return []
 
         allowed_resources = []
-        all_references = self.get_references(privilege_prefix, privilege_name)
         for resource in all_references:
-            resource_is_allowed = __is_allowed(all_references[resource])
-
-            # To avoid situations where we have an allow on a specific resource, but a deny
-            # on *, I'm making a special case here
-            # I should do regex intersections across each resource, but this will avoid
-            # common situations for now
-            if resource == "*" and not resource_is_allowed:
-                # Only apply this case when the deny statement has no condition
-                for stmt in all_references[resource]:
-                    if not stmt.effect_allow and "Condition" not in stmt.stmt:
-                        return []
-
-            if resource_is_allowed:
+            if self.__is_resource_allowed(
+                all_references[resource], privilege_prefix, privilege_name
+            ):
                 allowed_resources.append(resource)
 
         return allowed_resources
+
+    def __is_resource_allowed(self, stmts, privilege_prefix, privilege_name):
+        """
+        Given the statements that reference the same resource and privilege,
+        determine if the privilege is allowed on the resource.
+
+        Every statement is evaluated before reaching a conclusion so that the
+        result does not depend on statement order: a dangerous Allow must remain
+        visible even when an unconditional Deny appears earlier in the policy,
+        and an unconditional Deny must remain effective even when a dangerous
+        Allow appears later in the policy.
+
+        A Deny only counts as an unconditional Deny when it explicitly matches
+        the privilege via Action. A NotAction Deny, or a Deny guarded by a
+        Condition, may not apply at evaluation time, so it cannot suppress an
+        Allow. An explicit Deny on "*" denies the privilege for every resource,
+        which is handled by the caller through the shared resource references.
+        """
+        has_allow = False
+        for stmt in stmts:
+            if stmt.effect_allow:
+                has_allow = True
+                continue
+
+            if not self.__is_unconditional_deny(
+                stmt, privilege_prefix, privilege_name
+            ):
+                continue
+
+            # The privilege is explicitly denied for this resource. All
+            # statements were collected into this group up front, so other
+            # resources and the global "*" rule are still evaluated; only the
+            # shared conclusion for this resource is Deny.
+            return False
+
+        return has_allow
+
+    @staticmethod
+    def __is_unconditional_deny(stmt, privilege_prefix, privilege_name):
+        """
+        Return True only when the Deny statement unconditionally denies the
+        given privilege at static-analysis time.
+
+        - A Condition makes the Deny situational, so it is not counted.
+        - A NotAction statement only matches everything except the listed
+          actions. When the privilege is referenced, it is not being explicitly
+          denied, so a NotAction Deny is not counted.
+        """
+        if "Condition" in stmt.stmt:
+            return False
+
+        if "NotAction" in stmt.stmt:
+            return False
+
+        # NotResource statements are currently expanded to "*", so re-confirm the
+        # statement explicitly matches the privilege through its Action element.
+        return stmt.in_actions(privilege_prefix, privilege_name)
 
     def check_for_bad_patterns(self):
         """
