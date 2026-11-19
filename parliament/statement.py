@@ -328,7 +328,7 @@ class Statement:
 
         # Else, we're dealing with a NotAction
         for action in make_list(self.stmt["NotAction"]):
-            if action == "*" or action == "*:*":
+            if action.value == "*" or action.value == "*:*":
                 # I don't think it makes sense to have a "NotAction" of "*", but I'm including this check anyway.
                 return False
 
@@ -389,7 +389,13 @@ class Statement:
             if resource.value == "*":
                 affected_resources.append(resource.value)
 
-        return affected_resources
+        # De-duplicate while preserving order so each expanded resource has a
+        # unique identity.
+        unique_resources = []
+        for resource in affected_resources:
+            if resource not in unique_resources:
+                unique_resources.append(resource)
+        return unique_resources
 
     def add_finding(self, finding, detail=None, location={}):
         """
@@ -549,7 +555,7 @@ class Statement:
                     )
             elif operator.lower() == "null":
                 if (
-                    key.lower == "aws:MultiFactorAuthPresent".lower()
+                    key.lower() == "aws:MultiFactorAuthPresent".lower()
                     and "false" in values
                 ):
                     self.add_finding(

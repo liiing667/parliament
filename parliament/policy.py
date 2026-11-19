@@ -93,6 +93,33 @@ class Policy:
     def get_allowed_actions(self, raise_exceptions=True):
         actions_referenced = set()
         for stmt in self.statements:
+            if "NotAction" in stmt.stmt:
+                # A NotAction statement references every action except the ones
+                # listed, so expand the complement. Otherwise high-risk actions
+                # granted via "Allow" + "NotAction" would be invisible to the
+                # auditors. If an entry cannot be expanded precisely, it
+                # excludes nothing, which keeps this conservative.
+                excluded_actions = set()
+                for action in make_list(stmt.stmt["NotAction"]):
+                    excluded = expand_action(action.value, raise_exceptions=False)
+                    for expanded_action in excluded:
+                        excluded_actions.add(
+                            (
+                                expanded_action["service"],
+                                expanded_action["action"],
+                            )
+                        )
+                for expanded_action in expand_action("*"):
+                    action_id = (
+                        expanded_action["service"],
+                        expanded_action["action"],
+                    )
+                    if action_id not in excluded_actions:
+                        actions_referenced.add(
+                            "{}:{}".format(action_id[0], action_id[1])
+                        )
+                continue
+
             actions = make_list(stmt.stmt["Action"])
             for action in actions:
                 expanded_actions = expand_action(action.value, raise_exceptions)

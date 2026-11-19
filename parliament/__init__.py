@@ -249,6 +249,7 @@ def expand_action(action, raise_exceptions=True):
     unexpanded_action = parts[1]
 
     actions = []
+    actions_seen = set()
     service_match = None
     for service in iam_definition:
         if service["prefix"] == prefix.lower() or prefix == "*":
@@ -264,6 +265,15 @@ def expand_action(action, raise_exceptions=True):
                 if fnmatch.fnmatchcase(
                     privilege["privilege"].lower(), unexpanded_action.lower()
                 ):
+                    # The IAM definition may contain multiple service entries
+                    # with the same prefix (similar names such as
+                    # "AWS Identity and Access Management" and
+                    # "AWS Identity and Access Management (IAM)"), so ensure
+                    # each expanded action has a unique identity.
+                    action_id = (service_match["prefix"], privilege["privilege"])
+                    if action_id in actions_seen:
+                        continue
+                    actions_seen.add(action_id)
                     actions.append(
                         {
                             "service": service_match["prefix"],
